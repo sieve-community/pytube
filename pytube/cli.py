@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """A simple command line application to download youtube videos."""
+import random
 import argparse
 import gzip
 import json
@@ -10,25 +11,22 @@ import sys
 import datetime as dt
 import subprocess  # nosec
 from typing import List, Optional
-
 import pytube.exceptions as exceptions
 from pytube import __version__
-from pytube import CaptionQuery, Playlist, Stream, YouTube
+from pytube import CaptionQuery, Playlist, Stream
 from pytube.helpers import safe_filename, setup_logger
-
-
+from pytube import YouTube
 logger = logging.getLogger(__name__)
 
 
 def main():
-    """Command line application to download youtube videos."""
+    # temporary fix
+    from pytube import YouTube
     # noinspection PyTypeChecker
     parser = argparse.ArgumentParser(description=main.__doc__)
     args = _parse_args(parser)
     if args.verbose:
-        log_filename = None
-        if args.logfile:
-            log_filename = args.logfile
+        log_filename = args.logfile or None
         setup_logger(logging.DEBUG, log_filename=log_filename)
         logger.debug(f'Pytube version: {__version__}')
 
@@ -84,6 +82,8 @@ def _perform_args_on_youtube(
         ffmpeg_process(
             youtube=youtube, resolution=args.ffmpeg, target=args.target
         )
+    else:
+        print("..")
 
 
 def _parse_args(
@@ -93,7 +93,7 @@ def _parse_args(
         "url", help="The YouTube /watch or /playlist url", nargs="?"
     )
     parser.add_argument(
-        "--version", action="version", version="%(prog)s " + __version__,
+        "--version", action="version", version=f"%(prog)s {__version__}"
     )
     parser.add_argument(
         "--itag", type=int, help="The itag for the desired stream",
@@ -227,6 +227,7 @@ def display_progress_bar(
         Scale multiplier to reduce progress bar size.
 
     """
+
     columns = shutil.get_terminal_size().columns
     max_width = int(columns * scale)
 
@@ -372,15 +373,17 @@ def _ffmpeg_downloader(
         "audio",
         target=target,
     )
-    _download(stream=video_stream, target=target, filename=video_unique_name)
+    video_filename = f"{video_unique_name}.{video_stream.subtype}"
+    _download(stream=video_stream, target=target, filename=video_filename)
     print("Loading audio...")
-    _download(stream=audio_stream, target=target, filename=audio_unique_name)
+    audio_filename = f"{audio_unique_name}.{audio_stream.subtype}"
+    _download(stream=audio_stream, target=target, filename=audio_filename)
 
     video_path = os.path.join(
-        target, f"{video_unique_name}.{video_stream.subtype}"
+        target, video_filename
     )
     audio_path = os.path.join(
-        target, f"{audio_unique_name}.{audio_stream.subtype}"
+        target, audio_filename
     )
     final_path = os.path.join(
         target, f"{safe_filename(video_stream.title)}.{video_stream.subtype}"

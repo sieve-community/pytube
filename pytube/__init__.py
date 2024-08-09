@@ -12,6 +12,8 @@ __js_url__ = None
 from pytube.version import __version__
 from pytube.streams import Stream
 from pytube.captions import Caption
+from pytube.chapters import Chapter
+from pytube.keymoments import KeyMoment
 from pytube.query import CaptionQuery, StreamQuery
 from pytube.__main__ import YouTube
 from pytube.contrib.playlist import Playlist

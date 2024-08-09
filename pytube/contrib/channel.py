@@ -2,10 +2,10 @@
 """Module for interacting with a user's youtube channel."""
 import json
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Iterable, Any
 
-from pytube import extract, Playlist, request
-from pytube.helpers import uniqueify
+from pytube import extract, YouTube, Playlist, request
+from pytube.helpers import cache, uniqueify, DeferredGeneratorList
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 class Channel(Playlist):
     def __init__(self, url: str, proxies: Optional[Dict[str, str]] = None):
         """Construct a :class:`Channel <Channel>`.
-
         :param str url:
             A valid YouTube channel URL.
         :param proxies:
@@ -27,17 +26,27 @@ class Channel(Playlist):
             f"https://www.youtube.com{self.channel_uri}"
         )
 
+        self.featured_url = self.channel_url + '/featured'
         self.videos_url = self.channel_url + '/videos'
+        self.shorts_url = self.channel_url + '/shorts'
+        self.live_url = self.channel_url + '/streams'
+        self.releases_url = self.channel_url + '/releases'
         self.playlists_url = self.channel_url + '/playlists'
         self.community_url = self.channel_url + '/community'
         self.featured_channels_url = self.channel_url + '/channels'
         self.about_url = self.channel_url + '/about'
+
+        self._html_url = self.videos_url  # Videos will be preferred over short videos and live
+        self._visitor_data = None
 
         # Possible future additions
         self._playlists_html = None
         self._community_html = None
         self._featured_channels_html = None
         self._about_html = None
+
+    def __repr__(self) -> str:
+        return f'<pytube.contrib.Channel object: channelUri={self.channel_uri}>'
 
     @property
     def channel_name(self):
@@ -68,14 +77,31 @@ class Channel(Playlist):
         return self.initial_data['metadata']['channelMetadataRenderer'].get('vanityChannelUrl', None)  # noqa:E501
 
     @property
+    def html_url(self):
+        """Get the html url.
+
+        :rtype: str
+        """
+        return self._html_url
+
+    @html_url.setter
+    def html_url(self, value):
+        """Set the html url and clear the cache."""
+        if self._html_url != value:
+            self._html = None
+            self._initial_data = None
+            self.__class__.video_urls.fget.cache_clear()
+            self._html_url = value
+
+    @property
     def html(self):
-        """Get the html for the /videos page.
+        """Get the html for the /videos, /shorts or /streams page.
 
         :rtype: str
         """
         if self._html:
             return self._html
-        self._html = request.get(self.videos_url)
+        self._html = request.get(self.html_url)
         return self._html
 
     @property
@@ -134,8 +160,119 @@ class Channel(Playlist):
             self._about_html = request.get(self.about_url)
             return self._about_html
 
-    @staticmethod
-    def _extract_videos(raw_json: str) -> Tuple[List[str], Optional[str]]:
+    def url_generator(self):
+        """Generator that yields video URLs.
+
+        :Yields: Video URLs
+        """
+        for page in self._paginate(self.html):
+            for obj in page:
+                yield obj
+
+    def videos_generator(self):
+        for url in self.video_urls:
+            yield url
+
+    def _build_continuation_url(self, continuation: str) -> Tuple[str, dict, dict]:
+        """Helper method to build the url and headers required to request
+        the next page of videos, shorts or streams
+
+        :param str continuation: Continuation extracted from the json response
+            of the last page
+        :rtype: Tuple[str, dict, dict]
+        :returns: Tuple of an url and required headers for the next http
+            request
+        """
+        return (
+            (
+                # was changed to this format (and post requests)
+                # around the day 2024.04.16
+                "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false"
+            ),
+            {
+                "X-YouTube-Client-Name": "1",
+                "X-YouTube-Client-Version": "2.20240530.02.00",
+            },
+            # extra data required for post request
+            {
+                "continuation": continuation,
+                "context": {
+                    "client": {
+                        "clientName": "WEB",
+                        "visitorData": self._visitor_data,
+                        "osName": "Windows",
+                        "osVersion": "10.0",
+                        "clientVersion": "2.20240530.02.00",
+                        "platform": "DESKTOP"
+                    }
+                }
+            }
+        )
+
+    def _get_active_tab(self, initial_data) -> dict:
+        """ Receive the raw json and return the active page.
+
+        :returns: Active page json object.
+        """
+        active_tab = {}
+        # Possible tabs: Home, Videos, Shorts, Live, Releases, Playlists, Community, Channels, About
+        # We check each page for the URL that is active.
+        for tab in initial_data["contents"]["twoColumnBrowseResultsRenderer"]["tabs"]:
+            if 'tabRenderer' in tab:
+                tab_url = tab["tabRenderer"]["endpoint"]["commandMetadata"]["webCommandMetadata"]["url"]
+                if tab_url.rsplit('/', maxsplit=1)[-1] == self.html_url.rsplit('/', maxsplit=1)[-1]:
+                    active_tab = tab
+                    break
+        return active_tab
+
+    def _extract_obj_from_home(self) -> list:
+        """ Extract items from the channel home page.
+
+        :returns: list of home page objects.
+        """
+        items = []
+        try:
+            contents = self._get_active_tab(self.initial_data)['tabRenderer']['content'][
+                'sectionListRenderer']['contents']
+
+            for obj in contents:
+                item_section_renderer = obj['itemSectionRenderer']['contents'][0]
+
+                # Skip the presentation videos for non-subscribers
+                if 'channelVideoPlayerRenderer' in item_section_renderer:
+                    continue
+
+                # Skip presentation videos for subscribers
+                if 'channelFeaturedContentRenderer' in item_section_renderer:
+                    continue
+
+                # skip the list with channel members
+                if 'recognitionShelfRenderer' in item_section_renderer:
+                    continue
+
+                # Get the horizontal shorts
+                if 'reelShelfRenderer' in item_section_renderer:
+                    for x in item_section_renderer['reelShelfRenderer']['items']:
+                        items.append(x)
+
+                # Get videos, playlist and horizontal channels
+                if 'shelfRenderer' in item_section_renderer:
+                    # We only take items that are horizontal
+                    if 'horizontalListRenderer' in item_section_renderer['shelfRenderer']['content']:
+                        # We iterate over each item in the array, which could be videos, playlist or channel
+                        for x in item_section_renderer['shelfRenderer']['content']['horizontalListRenderer']['items']:
+                            items.append(x)
+
+        except (KeyError, IndexError, TypeError):
+            return []
+
+        # Extract object from each corresponding url
+        items_obj = self._extract_ids(items)
+
+        # remove duplicates
+        return uniqueify(items_obj)
+
+    def _extract_videos(self, raw_json: str, context: Optional[Any] = None) -> Tuple[List[str], Optional[str]]:
         """Extracts videos from a raw json page
 
         :param str raw_json: Input json extracted from the page or the last
@@ -148,12 +285,20 @@ class Channel(Playlist):
         # this is the json tree structure, if the json was extracted from
         # html
         try:
-            videos = initial_data["contents"][
-                "twoColumnBrowseResultsRenderer"][
-                "tabs"][1]["tabRenderer"]["content"][
-                "sectionListRenderer"]["contents"][0][
-                "itemSectionRenderer"]["contents"][0][
-                "gridRenderer"]["items"]
+            active_tab = self._get_active_tab(initial_data)
+            try:
+                # This is the json tree structure for videos, shorts and streams
+                items = active_tab['tabRenderer']['content']['richGridRenderer']['contents']
+            except (KeyError, IndexError, TypeError):
+                # This is the json tree structure for playlists
+                items = active_tab['tabRenderer']['content']['sectionListRenderer']['contents'][0][
+                    'itemSectionRenderer']['contents'][0]['gridRenderer']['items']
+
+            # This is the json tree structure of visitor data
+            # It is necessary to send the visitorData together with the continuation token
+            self._visitor_data = initial_data["responseContext"]["webResponseContextExtensionData"][
+                "ytConfigData"]["visitorData"]
+
         except (KeyError, IndexError, TypeError):
             try:
                 # this is the json tree structure, if the json was directly sent
@@ -161,7 +306,7 @@ class Channel(Playlist):
                 important_content = initial_data[1]['response']['onResponseReceivedActions'][
                     0
                 ]['appendContinuationItemsAction']['continuationItems']
-                videos = important_content
+                items = important_content
             except (KeyError, IndexError, TypeError):
                 try:
                     # this is the json tree structure, if the json was directly sent
@@ -169,33 +314,256 @@ class Channel(Playlist):
                     # no longer a list and no longer has the "response" key
                     important_content = initial_data['onResponseReceivedActions'][0][
                         'appendContinuationItemsAction']['continuationItems']
-                    videos = important_content
+                    items = important_content
                 except (KeyError, IndexError, TypeError) as p:
                     logger.info(p)
                     return [], None
 
         try:
-            continuation = videos[-1]['continuationItemRenderer'][
+            continuation = items[-1]['continuationItemRenderer'][
                 'continuationEndpoint'
             ]['continuationCommand']['token']
-            videos = videos[:-1]
+            items = items[:-1]
         except (KeyError, IndexError):
             # if there is an error, no continuation is available
             continuation = None
 
+        # Extract object from each corresponding url
+        items_obj = self._extract_ids(items)
+
         # remove duplicates
-        return (
-            uniqueify(
-                list(
-                    # only extract the video ids from the video data
-                    map(
-                        lambda x: (
-                            f"/watch?v="
-                            f"{x['gridVideoRenderer']['videoId']}"
-                        ),
-                        videos
-                    )
-                ),
-            ),
-            continuation,
-        )
+        return uniqueify(items_obj), continuation
+
+    def _extract_ids(self, items: list) -> list:
+        """ Iterate over the extracted urls.
+
+        :returns: List of YouTube, Playlist or Channel objects.
+        """
+        items_obj = []
+        for x in items:
+            items_obj.append(self._extract_video_id(x))
+        return items_obj
+
+    def _extract_video_id(self, x: dict):
+        """ Try extracting video ids, if it fails, try extracting shorts ids.
+
+        :returns: List of YouTube, Playlist or Channel objects.
+        """
+        try:
+            return YouTube(f"/watch?v="
+                           f"{x['richItemRenderer']['content']['videoRenderer']['videoId']}")
+        except (KeyError, IndexError, TypeError):
+            return self._extract_shorts_id(x)
+
+    def _extract_shorts_id(self, x: dict):
+        """ Try extracting shorts ids, if it fails, try extracting release ids.
+
+        :returns: List of YouTube, Playlist or Channel objects.
+        """
+        try:
+            return YouTube(f"/watch?v="
+                           f"{x['richItemRenderer']['content']['reelItemRenderer']['videoId']}")
+        except (KeyError, IndexError, TypeError):
+            return self._extract_release_id(x)
+
+    def _extract_release_id(self, x: dict):
+        """ Try extracting release ids, if it fails, try extracting video IDs from the home page.
+
+        :returns: List of YouTube, Playlist or Channel objects.
+        """
+        try:
+            return Playlist(f"/playlist?list="
+                            f"{x['richItemRenderer']['content']['playlistRenderer']['playlistId']}")
+        except (KeyError, IndexError, TypeError):
+            return self._extract_video_id_from_home(x)
+
+    def _extract_video_id_from_home(self, x: dict):
+        """ Try extracting the video IDs from the home page,
+        if that fails, try extracting the shorts IDs from the home page.
+
+        :returns: List of YouTube, Playlist or Channel objects.
+        """
+        try:
+            return YouTube(f"/watch?v="
+                           f"{x['gridVideoRenderer']['videoId']}")
+        except (KeyError, IndexError, TypeError):
+            return self._extract_shorts_id_from_home(x)
+
+    def _extract_shorts_id_from_home(self, x: dict):
+        """ Try extracting the shorts IDs from the home page, if that fails, try extracting the playlist IDs.
+
+        :returns: List of YouTube, Playlist or Channel objects.
+        """
+        try:
+            return YouTube(f"/watch?v="
+                           f"{x['reelItemRenderer']['videoId']}")
+        except (KeyError, IndexError, TypeError):
+            return self._extract_playlist_id(x)
+
+    def _extract_playlist_id(self, x: dict):
+        """ Try extracting the playlist IDs, if that fails, try extracting the channel IDs.
+
+        :returns: List of YouTube, Playlist or Channel objects.
+        """
+        try:
+            return Playlist(f"/playlist?list="
+                            f"{x['gridPlaylistRenderer']['playlistId']}")
+        except (KeyError, IndexError, TypeError):
+            return self._extract_channel_id_from_home(x)
+
+    @staticmethod
+    def _extract_channel_id_from_home(x: dict):
+        """ Try extracting the channel IDs from the home page, if that fails, return nothing.
+
+        :returns: List of YouTube, Playlist or Channel objects.
+        """
+        try:
+            return Channel(f"/channel/"
+                           f"{x['gridChannelRenderer']['channelId']}")
+        except (KeyError, IndexError, TypeError):
+            return ''
+
+    @property
+    def views(self) -> int:
+        """Extract view count for channel.
+
+        :return: Channel view count
+        :rtype: int
+        """
+        self.html_url = self.about_url
+
+        try:
+            views_text = self.initial_data['onResponseReceivedEndpoints'][0]['showEngagementPanelEndpoint'][
+                'engagementPanel']['engagementPanelSectionListRenderer']['content']['sectionListRenderer'][
+                'contents'][0]['itemSectionRenderer']['contents'][0]['aboutChannelRenderer']['metadata'][
+                'aboutChannelViewModel']['viewCountText']
+
+            # "1,234,567 view"
+            count_text = views_text.split(' ')[0]
+            # "1234567"
+            count_text = count_text.replace(',', '')
+            return int(count_text)
+        except KeyError:
+            return 0
+
+    @property
+    def description(self) -> str:
+        """Extract the channel description.
+
+        :return: Channel description
+        :rtype: str
+        """
+        self.html_url = self.channel_url
+        return self.initial_data['metadata']['channelMetadataRenderer']['description']
+
+    def find_videos_info(self, data):
+        """Recursively search for 'videos' in the text content of the JSON."""
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if key == 'content' and isinstance(value, str) and 'videos' in value:
+                    return value
+                if isinstance(value, (dict, list)):
+                    result = self.find_videos_info(value)
+                    if result:
+                        return result
+        elif isinstance(data, list):
+            for item in data:
+                result = self.find_videos_info(item)
+                if result:
+                    return result
+        return None
+
+    @property
+    def length(self):
+        """Extracts the approximate amount of videos from the channel."""
+        try:
+            result = self.find_videos_info(self.initial_data)
+            return result if result else 'Unknown'
+        except Exception as e:
+            print(f"Exception: {e}")
+            return 'Unknown'
+
+    @property
+    def last_updated(self) -> str:
+        """Extract the date of the last uploaded video.
+
+        :return: Last video uploaded
+        :rtype: str
+        """
+        self.html_url = self.videos_url
+        try:
+            last_updated_text = self.initial_data['contents']['twoColumnBrowseResultsRenderer']['tabs'][1][
+                'tabRenderer']['content']['richGridRenderer']['contents'][0]['richItemRenderer']['content'][
+                'videoRenderer']['publishedTimeText']['simpleText']
+            return last_updated_text
+        except KeyError:
+            return None
+
+    @property
+    def thumbnail_url(self) -> str:
+        """extract the profile image from the json of the channel home page
+
+        :rtype: str
+        :return: a string with the url of the channel's profile image
+        """
+        self.html_url = self.channel_url  # get the url of the channel home page
+        return self.initial_data['metadata']['channelMetadataRenderer']['avatar']['thumbnails'][0]['url']
+
+    @property
+    def home(self) -> list:
+        """ Yields YouTube, Playlist and Channel objects from the channel home page.
+
+        :returns: List of YouTube, Playlist and Channel objects.
+        """
+        self.html_url = self.featured_url  # Set home tab
+        return self._extract_obj_from_home()
+
+    @property
+    def videos(self) -> Iterable[YouTube]:
+        """Yields YouTube objects of videos in this channel
+
+        :rtype: List[YouTube]
+        :returns: List of YouTube
+        """
+        self.html_url = self.videos_url  # Set video tab
+        return DeferredGeneratorList(self.videos_generator())
+
+    @property
+    def shorts(self) -> Iterable[YouTube]:
+        """Yields YouTube objects of short videos in this channel
+
+       :rtype: List[YouTube]
+       :returns: List of YouTube
+       """
+        self.html_url = self.shorts_url  # Set shorts tab
+        return DeferredGeneratorList(self.videos_generator())
+
+    @property
+    def live(self) -> Iterable[YouTube]:
+        """Yields YouTube objects of live in this channel
+
+       :rtype: List[YouTube]
+       :returns: List of YouTube
+       """
+        self.html_url = self.live_url  # Set streams tab
+        return DeferredGeneratorList(self.videos_generator())
+
+    @property
+    def releases(self) -> Iterable[Playlist]:
+        """Yields Playlist objects in this channel
+
+       :rtype: List[Playlist]
+       :returns: List of YouTube
+       """
+        self.html_url = self.releases_url  # Set releases tab
+        return DeferredGeneratorList(self.videos_generator())
+
+    @property
+    def playlists(self) -> Iterable[Playlist]:
+        """Yields Playlist objects in this channel
+
+       :rtype: List[Playlist]
+       :returns: List of Playlist
+       """
+        self.html_url = self.playlists_url  # Set playlists tab
+        return DeferredGeneratorList(self.videos_generator())
